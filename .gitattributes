@@ -1,7 +1,28 @@
-*.gitignore filter=lfs diff=lfs merge=lfs -text
-*.python-version filter=lfs diff=lfs merge=lfs -text
-*.py filter=lfs diff=lfs merge=lfs -text
+*.png, filter=lfs diff=lfs merge=lfs -text
+*.jpg, filter=lfs diff=lfs merge=lfs -text
+*.jpeg, filter=lfs diff=lfs merge=lfs -text
 *.mp4 filter=lfs diff=lfs merge=lfs -text
-*.jpg filter=lfs diff=lfs merge=lfs -text
-*.txt filter=lfs diff=lfs merge=lfs -text
-* !text !filter !merge !diff
+# Basic .gitattributes for a python repo.
+# Source files
+# ============
+*.pxd    text diff=python
+*.py     text diff=python
+*.py3    text diff=python
+*.pyw    text diff=python
+*.pyx    text diff=python
+*.pyz    text diff=python
+*.pyi    text diff=python
+# Binary files
+*.db     binary
+*.p      binary
+*.pkl    binary
+*.pickle binary
+*.pyc    binary export-ignore
+*.pyo    binary export-ignore
+*.pyd    binary
+# Jupyter notebook
+*.ipynb  text eol=lf
+# Note: .db, .p, and .pkl files are associated
+# with the python modules ``pickle``, ``dbm.*``,
+# ``shelve``, ``marshal``, ``anydbm``, & ``bsddb``
+# (among others).
