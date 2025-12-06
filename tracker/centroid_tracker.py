@@ -1,9 +1,10 @@
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import distance as dist
 from collections import OrderedDict
 import numpy as np
 
 class CentroidTracker:
-    def __init__(self, max_disappeared=20, max_distance=50):
+    def __init__(self, max_disappeared=2, max_distance=5):
         self.next_object_id = 0
         self.objects = OrderedDict()
         self.disappeared = OrderedDict()
@@ -48,13 +49,14 @@ class CentroidTracker:
 
         D = dist.cdist(np.array(object_centroids), input_centroids)
 
-        rows = D.min(axis=1).argsort()
-        cols = D.argmin(axis=1)[rows]
+        # REEMPLAZO: Usar Algoritmo Húngaro para asignación óptima global
+        rows, cols = linear_sum_assignment(D)
 
         used_rows = set()
         used_cols = set()
 
         for (row, col) in zip(rows, cols):
+            # El algoritmo húngaro garantiza unicidad, pero mantenemos la verificación por seguridad
             if row in used_rows or col in used_cols:
                 continue
 

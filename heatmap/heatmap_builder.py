@@ -68,7 +68,8 @@ class HeatmapBuilder:
                 val = float(temp.max() * 0.6 + 40)
                 cv2.circle(temp, (cx, cy), 60, val, -1)
 
-        smooth = gaussian_filter(temp, sigma=25)
+        # CAMBIO: Aumentar sigma para que los puntos se fusionen (antes 15)
+        smooth = gaussian_filter(temp, sigma=35)
         norm = cv2.normalize(smooth, None, 0, 255, cv2.NORM_MINMAX)
         img_u8 = norm.astype(np.uint8)
         heat_img = cv2.applyColorMap(img_u8, cv2.COLORMAP_JET)
