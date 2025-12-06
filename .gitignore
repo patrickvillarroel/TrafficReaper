@@ -213,6 +213,8 @@ __marimo__/
 output/
 outputs/
 
+storage/
+
 
 # Streamlit
 .streamlit/secrets.toml
