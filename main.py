@@ -91,7 +91,7 @@ def analyze_image(frame, save_outputs=False):
         smoothed_centroids[tid] = (sx, sy)
 
     # Eliminar KF viejos (5s sin actualizar)
-    for tid in list(global_kf_map.keys()):
+    for tid in global_kf_map.keys():
         if tid not in tracked and now - global_kf_last.get(tid, 0) > 5:
             del global_kf_map[tid]
             del global_kf_last[tid]
@@ -125,13 +125,11 @@ def analyze_image(frame, save_outputs=False):
     cluster_results = []
 
     for idx, cpts in enumerate(clusters):
-
-        density, csize = density_engine.evaluate_cluster(cpts)
+        density, csize = DensityEngine.evaluate_cluster(cpts)
         smooth_density = smoother.push(density)
 
-        priority = alert_system.classify_priority(
+        priority = AlertSystem.classify_priority(
             density=smooth_density,
-            cluster_size=csize,
             speed_variance=0.1
         )
 

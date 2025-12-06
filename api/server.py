@@ -22,8 +22,8 @@ def load_latest_json(directory: Path, prefix: str):
     if not files:
         return None
 
-    with open(files[0], "r") as f:
-        return json.load(f)
+    with open(files[0], "r") as file:
+        return json.load(file)
 
 
 # ---------------------------------------------------

@@ -1,6 +1,6 @@
 # modules/alert_system.py
 import json
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 
 class AlertSystem:
@@ -8,7 +8,8 @@ class AlertSystem:
         self.out_path = Path(out_file)
         self.alerts = []
 
-    def classify_priority(self, density, cluster_size, speed_variance):
+    @classmethod
+    def classify_priority(cls, density: float, speed_variance: float):
         """
         density: número de vehículos en el cluster
         cluster_size: tamaño físico del cluster
@@ -31,7 +32,7 @@ class AlertSystem:
 
     def push_alert(self, cluster_id, priority, info):
         alert = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "cluster_id": cluster_id,
             "priority": priority,
             "details": info

@@ -6,7 +6,8 @@ class DensityEngine:
     def __init__(self, min_points=4):
         self.min_points = min_points
 
-    def evaluate_cluster(self, cluster_points):
+    @classmethod
+    def evaluate_cluster(cls, cluster_points):
         density = len(cluster_points)
 
         # Calcular tamaño físico del cluster (radio aprox)

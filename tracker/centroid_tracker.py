@@ -24,7 +24,7 @@ class CentroidTracker:
     def update(self, detections):
         if len(detections) == 0:
             remove = []
-            for obj_id in list(self.disappeared.keys()):
+            for obj_id in self.disappeared.keys():
                 self.disappeared[obj_id] += 1
                 if self.disappeared[obj_id] > self.max_disappeared:
                     remove.append(obj_id)
@@ -47,10 +47,10 @@ class CentroidTracker:
         object_ids = list(self.objects.keys())
         object_centroids = list(self.objects.values())
 
-        D = dist.cdist(np.array(object_centroids), input_centroids)
+        distance = dist.cdist(np.array(object_centroids), input_centroids)
 
         # REEMPLAZO: Usar Algoritmo Húngaro para asignación óptima global
-        rows, cols = linear_sum_assignment(D)
+        rows, cols = linear_sum_assignment(distance)
 
         used_rows = set()
         used_cols = set()
@@ -60,7 +60,7 @@ class CentroidTracker:
             if row in used_rows or col in used_cols:
                 continue
 
-            if D[row, col] > self.max_distance:
+            if distance[row, col] > self.max_distance:
                 continue
 
             obj_id = object_ids[row]
@@ -70,7 +70,7 @@ class CentroidTracker:
             used_rows.add(row)
             used_cols.add(col)
 
-        unused_rows = set(range(0, D.shape[0])).difference(used_rows)
+        unused_rows = set(range(0, distance.shape[0])).difference(used_rows)
         for row in unused_rows:
             obj_id = object_ids[row]
             self.disappeared[obj_id] += 1
