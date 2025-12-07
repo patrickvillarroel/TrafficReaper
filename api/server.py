@@ -1,55 +1,351 @@
-from fastapi import FastAPI, HTTPException
-from pathlib import Path
 import json
 
-from starlette.responses import FileResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, BackgroundTasks
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.middleware.cors import CORSMiddleware
+from pathlib import Path
+from datetime import datetime
+import numpy as np
+import uuid
+import cv2
+import io
 
-app = FastAPI()
+from starlette.requests import Request
 
-BASE_DIR = Path("storage")
-ALERT_DIR = BASE_DIR / "alerts"
-SNAP_DIR = BASE_DIR / "snapshots"
+from api.model.TaskStatus import TaskStatus
+from api.model.models import TaskResponse, TaskResult, PaginatedResponse, DetectionResult
+from api.util.image_utils import compress_image_to_bytes, validate_image_file, compress_image_if_needed
+from api.util.json_utils import convert_paths_to_urls, load_task_from_json
+
+# ==================== CONFIGURACIÓN ====================
+_project_root = Path(__file__).parent.parent.resolve()
+_STORAGE_PATH = _project_root / "storage"
+_ALERT_DIR = _STORAGE_PATH / "alerts"
+_SNAPSHOT_DIR = _STORAGE_PATH / "snapshots"
+_OUTPUTS_DIR = _STORAGE_PATH / "outputs"
+
+# Crear directorios si no existen
+for _directory in [_ALERT_DIR, _SNAPSHOT_DIR, _OUTPUTS_DIR]:
+    _directory.mkdir(parents=True, exist_ok=True)
+
+# Configuración de imagen
+_MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
+_CONTENT_TYPE_IMAGE_JPEG = "image/jpeg"
+_COMPRESSED_DESCRIPTION = "Retornar imagen comprimida"
+
+# Mensajes de error
+_TASK_NO_ENCONTRADA = "Task no encontrada"
+
+# Cola de procesamiento (en producción usar Celery/Redis)
+task_results: dict[str, TaskResult] = {}  # {task_id: result_dict}
 
 
-def load_latest_json(directory: Path, prefix: str):
-    """Devuelve el JSON más reciente según el prefijo."""
-    files = sorted(
-        directory.glob(f"{prefix}_*.json"),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True
+def process_image_task(task_id: str, image_bytes: bytes):
+    """Procesa la imagen en background directamente desde bytes."""
+    try:
+        from traffic_analyzer import analyze_image
+
+        # Actualizar estado
+        task_results[task_id].status = TaskStatus.PROCESSING
+
+        # Convertir bytes a numpy array (sin guardar en disco)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            raise ValueError("No se pudo decodificar la imagen")
+
+        # Comprimir si es necesario
+        frame = compress_image_if_needed(frame)
+
+        # Analizar
+        result = analyze_image(frame, save_outputs=True, save_dir=_OUTPUTS_DIR)
+
+        # Guardar resultado con task_id y timestamps
+        result["task_id"] = task_id
+        result["created_at"] = task_results[task_id].created_at
+        result["completed_at"] = datetime.now().isoformat()
+        result["original_filename"] = task_results[task_id].original_filename
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Guardar JSON del resultado
+        result_path = _OUTPUTS_DIR / f"result_{task_id}_{timestamp}.json"
+        with io.open(result_path, "w") as f:
+            json.dump(result, f, indent=2)
+
+        # Actualizar task_results
+        actual = task_results[task_id]
+        actual.status = TaskStatus.COMPLETED
+        actual.completed_at = result["completed_at"]
+        actual.result = DetectionResult(**result)
+        task_results[task_id] = actual
+
+    except Exception as e:
+        print(f"Error procesando task {task_id}: {e}")
+        actual = task_results[task_id]
+        actual.status = TaskStatus.FAILED
+        actual.completed_at = datetime.now().isoformat()
+        actual.error = str(e)
+        task_results[task_id] = actual
+
+
+# ==================== API ====================
+app = FastAPI(
+    title="Traffic Reaper API",
+    description="API para análisis de tráfico vehicular con YOLO",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/", tags=["Health"])
+def root():
+    """Endpoint de health check."""
+    return {
+        "status": "online",
+        "service": "Traffic Reaper API",
+        "version": "1.0.0"
+    }
+
+
+@app.get("/model/info", tags=["Health"])
+def get_model_info():
+    """Obtiene información sobre el modelo YOLO."""
+    try:
+        import sys
+        from pathlib import Path
+
+        # Agregar el directorio raíz al path
+        project_root = Path(__file__).parent.parent.resolve()
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+
+        from traffic_analyzer import get_model_info
+
+        return get_model_info()
+    except Exception as e:
+        return {
+            "error": str(e),
+            "loaded": False
+        }
+
+
+# ==================== ENDPOINTS DE ANÁLISIS ====================
+@app.post("/analyze", response_model=TaskResponse, tags=["Analysis"])
+async def analyze_image_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., media_type="image/*", description="Imagen a analizar")
+):
+    """
+    Encola una imagen para análisis.
+    Retorna un task_id para consultar el resultado posteriormente.
+    La imagen se procesa directamente en memoria sin guardar archivo temporal.
+    """
+    # Validar archivo
+    is_valid, message = validate_image_file(file)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=message)
+
+    # Leer contenido en memoria
+    contents = await file.read()
+    if len(contents) > _MAX_IMAGE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Imagen muy grande. Máximo: {_MAX_IMAGE_SIZE / 1024 / 1024} MB"
+        )
+
+    # Generar task_id
+    task_id = str(uuid.uuid4())
+
+    # Crear registro de tarea
+    task_results[task_id] = TaskResult(
+        task_id=task_id,
+        status=TaskStatus.PENDING,
+        created_at=datetime.now().isoformat(),
+        original_filename=file.filename
     )
 
-    if not files:
-        return None
+    # Agregar a background tasks (pasamos bytes directamente)
+    background_tasks.add_task(process_image_task, task_id, contents)
 
-    with open(files[0], "r") as file:
-        return json.load(file)
-
-
-# ---------------------------------------------------
-# 🟥 Última alerta generada
-# ---------------------------------------------------
-@app.get("/alerts/latest")
-def get_latest_alert():
-    data = load_latest_json(ALERT_DIR, "alert")
-    if not data:
-        raise HTTPException(status_code=404, detail="No hay alertas todavía.")
-    return data
+    return TaskResponse(
+        task_id=task_id,
+        status=TaskStatus.PENDING,
+        created_at=task_results[task_id].created_at,
+        message="Imagen encolada para procesamiento"
+    )
 
 
-# ---------------------------------------------------
-# 🟦 Último snapshot generado
-# ---------------------------------------------------
-@app.get("/snapshots/latest")
-def get_latest_snapshot():
-    data = load_latest_json(SNAP_DIR, "snapshot")
-    if not data:
-        raise HTTPException(status_code=404, detail="No hay snapshots todavía.")
-    return data
+@app.get("/tasks/{task_id}", response_model=TaskResult, tags=["Analysis"])
+def get_task_result(task_id: str, request: Request):
+    """
+    Obtiene el resultado de una tarea de análisis.
+    Busca primero en memoria, luego en disco.
+    """
+    # Buscar en memoria
+    if task_id in task_results:
+        task_data = task_results[task_id].model_copy()
 
-@app.get("/imagen/{timestamp}")
-def get_imagen(timestamp: str):
-    ruta = BASE_DIR / "outputs" / f"alert_{timestamp}.png"
-    if not ruta.exists():
-        raise HTTPException(status_code=404, detail="No existe la imagen.")
-    return FileResponse(ruta, media_type="image/png")
+        # Convertir paths a URLs si la tarea está completada
+        if task_data.status == TaskStatus.COMPLETED and task_data.result:
+            base_url = str(request.base_url).rstrip("/")
+            task_data.result = convert_paths_to_urls(task_id, task_data.result, base_url)
+
+        return task_data
+
+    # Buscar en disco
+    task_data = load_task_from_json(task_id, _OUTPUTS_DIR)
+    if task_data:
+        # Convertir paths a URLs
+        base_url = str(request.base_url).rstrip("/")
+        task_data.result = convert_paths_to_urls(task_id, task_data.result, base_url)
+
+        return task_data
+
+    raise HTTPException(status_code=404, detail="Task no encontrada")
+
+
+@app.get("/tasks", tags=["Analysis"])
+def list_tasks(
+    status: TaskStatus | None = None,
+    page: int = Query(1, ge=1, description="Número de página"),
+    page_size: int = Query(20, ge=1, le=100, description="Tamaño de página"),
+    include_disk: bool = Query(True, description="Incluir tareas guardadas en disco"),
+    request: Request = None
+):
+    """
+    Lista todas las tareas con paginación, opcionalmente filtradas por estado.
+    Combina tareas en memoria y en disco.
+    """
+    tasks = list(task_results.values())
+
+    # Cargar tareas desde disco si se solicita
+    if include_disk:
+        seen_task_ids = {t.task_id for t in tasks}
+
+        # Buscar todos los JSON de resultados
+        for json_file in _OUTPUTS_DIR.glob("result_*_*.json"):
+            try:
+                # Extraer task_id del nombre del archivo
+                filename = json_file.stem  # result_task-id_timestamp
+                parts = filename.split("_", 2)
+                if len(parts) >= 2:
+                    file_task_id = parts[1]
+
+                    # Evitar duplicados
+                    if file_task_id not in seen_task_ids:
+                        task_data = load_task_from_json(file_task_id, _OUTPUTS_DIR)
+                        if task_data:
+                            tasks.append(task_data)
+                            seen_task_ids.add(file_task_id)
+            except Exception as e:
+                print(f"Error loading task from {json_file}: {e}")
+                continue
+
+    # Filtrar por estado
+    if status:
+        tasks = [t for t in tasks if t.status == status]
+
+    # Ordenar por fecha de creación (más reciente primero)
+    tasks.sort(key=lambda x: x.created_at, reverse=True)
+
+    # Calcular paginación
+    total = len(tasks)
+    total_pages = (total + page_size - 1) // page_size
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+
+    # Obtener tareas de la página actual
+    page_tasks = tasks[start_idx:end_idx]
+
+    # Convertir paths a URLs en los resultados
+    if request:
+        base_url = str(request.base_url).rstrip("/")
+        for task in page_tasks:
+            if task.status == TaskStatus.COMPLETED and task.result:
+                task.result = convert_paths_to_urls(task.task_id, task.result, base_url)
+
+    return PaginatedResponse(
+        data=page_tasks,
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        has_next=page < total_pages,
+        has_prev=page > 1,
+    )
+
+
+# ==================== ENDPOINTS DE IMÁGENES ====================
+def _get_result(task_id: str):
+    # Buscar en memoria
+    task_data = task_results.get(task_id)
+
+    # Si no está en memoria, buscar en disco
+    if not task_data:
+        task_data = load_task_from_json(task_id, _OUTPUTS_DIR)
+
+    if not task_data:
+        raise HTTPException(status_code=404, detail=_TASK_NO_ENCONTRADA)
+
+    if task_data.status != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Task no completada aún")
+
+    return task_data.result
+
+
+def _deliver_image(path: str, compressed: bool):
+    if not compressed:
+        return FileResponse(path, media_type=_CONTENT_TYPE_IMAGE_JPEG)
+
+    # Comprimir imagen
+    image = cv2.imread(path)
+    compressed_bytes = compress_image_to_bytes(image)
+
+    return StreamingResponse(
+        io.BytesIO(compressed_bytes),
+        media_type=_CONTENT_TYPE_IMAGE_JPEG
+    )
+
+
+@app.get("/images/{task_id}/overlay", tags=["Images"])
+def get_overlay_image(
+    task_id: str,
+    compressed: bool = Query(True, description=_COMPRESSED_DESCRIPTION)
+):
+    """Obtiene la imagen overlay (con detecciones) de una tarea."""
+    result = _get_result(task_id)
+    overlay_path = result.saved_overlay if result is not None else None
+
+    if not overlay_path or not Path(overlay_path).exists():
+        raise HTTPException(status_code=404, detail="Imagen overlay no encontrada")
+
+    return _deliver_image(overlay_path, compressed)
+
+
+@app.get("/images/{task_id}/heatmap", tags=["Images"])
+def get_heatmap_image(
+    task_id: str,
+    compressed: bool = Query(True, description=_COMPRESSED_DESCRIPTION)
+):
+    """Obtiene el heatmap de una tarea."""
+    result = _get_result(task_id)
+    heat_path = result.saved_heatmap if result is not None else None
+
+    if not heat_path or not Path(heat_path).exists():
+        raise HTTPException(status_code=404, detail="Heatmap no encontrado")
+
+    return _deliver_image(heat_path, compressed)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
