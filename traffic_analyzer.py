@@ -1,5 +1,3 @@
-# traffic_analyzer.py
-
 import cv2
 import time
 import torch
@@ -14,33 +12,50 @@ from modules.density_engine import DensityEngine
 from modules.smoothing import TemporalSmoother
 from modules.json_writer import JSONWriter
 
-# Configuracion Global
-MODEL_PATH = "yolov8x.pt"
+# Obtener el directorio raíz del proyecto (donde está traffic_analyzer.py)
+PROJECT_ROOT = Path(__file__).parent.resolve()
+
+# Configuración Global con rutas absolutas
+MODEL_PATH = PROJECT_ROOT / "yolov8x.pt"
 CONF_THRESH = 0.45
 ALERT_INTENSITY_THRESHOLD = 120.0
 ALERT_CLUSTER_COUNT = 15
-SAVE_DIR = Path("outputs")
-SAVE_DIR.mkdir(exist_ok=True)
+
+# INICIALIZACIÓN LAZY DEL MODELO
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = YOLO(MODEL_PATH)
-model.to(device)
+model = None  # Se inicializa al primer uso
+
+def _init_model():
+    """Inicializa el modelo YOLO solo cuando se necesita."""
+    global model
+    if model is None:
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(
+                f"Modelo YOLO no encontrado en: {MODEL_PATH}\n"
+                f"Por favor descarga el modelo o ajusta MODEL_PATH"
+            )
+        print(f"Cargando modelo YOLO desde: {MODEL_PATH}")
+        model = YOLO(str(MODEL_PATH))
+        model.to(device)
+        print(f"Modelo cargado en dispositivo: {device}")
+    return model
 
 # Módulos persistentes entre llamadas
-alert_system = AlertSystem()
+alert_system = AlertSystem(PROJECT_ROOT / "outputs/alerts.json")
 density_engine = DensityEngine()
 smoother = TemporalSmoother(window=5)
-writer = JSONWriter()
+writer = JSONWriter(PROJECT_ROOT / "storage")
 
 # Trackers globales entre llamadas
 global_tracker = CentroidTracker(max_disappeared=10, max_distance=200)
 global_kf_map = {}
 global_kf_last = {}
 
-heatmap_instance = None
+heatmap_instance: HeatmapBuilder | None = None
 H = W = None
 
 
-def analyze_image(frame, save_outputs=False):
+def analyze_image(frame: cv2.typing.MatLike, save_outputs=False, save_dir=PROJECT_ROOT / "outputs"):
     """
     Procesa una sola imagen.
     frame: numpy array (BGR) leído por cv2.imdecode o cv2.imread
@@ -51,6 +66,9 @@ def analyze_image(frame, save_outputs=False):
 
     global heatmap_instance, H, W, global_kf_map, global_kf_last
 
+    # Inicializar modelo si no está cargado
+    current_model = _init_model()
+
     h, w = frame.shape[:2]
 
     if H != h or W != w:
@@ -60,7 +78,7 @@ def analyze_image(frame, save_outputs=False):
     # Reinicia heatmap solo para esta imagen
     heatmap_instance.reset()
 
-    results = model(frame, imgsz=4000, conf=CONF_THRESH)
+    results = current_model(frame, imgsz=4000, conf=CONF_THRESH)
     r = results[0]
 
     dets = []
@@ -151,14 +169,13 @@ def analyze_image(frame, save_outputs=False):
     if alert_flag:
         alert_reason = f"I={max_intensity:.1f}, clusters={len(clusters)}"
 
-    # Guardar imagen
     saved_overlay = None
     saved_heat = None
 
     if save_outputs:
         ts = time.strftime("%Y%m%d_%H%M%S")
-        saved_overlay = str(SAVE_DIR / f"overlay_{ts}.png")
-        saved_heat = str(SAVE_DIR / f"heat_{ts}.png")
+        saved_overlay = str(save_dir / f"overlay_{ts}.png")
+        saved_heat = str(save_dir / f"heat_{ts}.png")
 
         cv2.imwrite(saved_overlay, overlay)
         cv2.imwrite(saved_heat, heat_img)
@@ -174,4 +191,32 @@ def analyze_image(frame, save_outputs=False):
         "alert_reason": alert_reason,
         "saved_overlay": saved_overlay,
         "saved_heatmap": saved_heat
+    }
+
+
+def reset_trackers():
+    """Reinicia todos los trackers globales."""
+    global global_tracker, global_kf_map, global_kf_last, heatmap_instance
+
+    global_tracker = CentroidTracker(max_disappeared=10, max_distance=200)
+    global_kf_map = {}
+    global_kf_last = {}
+
+    if heatmap_instance:
+        heatmap_instance.reset()
+
+
+def get_model_info():
+    """Retorna información sobre el modelo cargado."""
+    if model is None:
+        return {
+            "loaded": False,
+            "path": str(MODEL_PATH),
+            "device": device
+        }
+    return {
+        "loaded": True,
+        "path": str(MODEL_PATH),
+        "device": device,
+        "model_type": type(model).__name__
     }

@@ -1,7 +1,7 @@
 # test_analyze.py
 
 import cv2
-from main import analyze_image
+from traffic_analyzer import analyze_image
 
 if __name__ == "__main__":
     IMAGE_PATH = "data/images/UTP4.jpg"
