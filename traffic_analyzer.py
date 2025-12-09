@@ -30,7 +30,7 @@ def _init_model():
     global model
     if model is None:
         if not MODEL_PATH.exists():
-            raise FileNotFoundError(
+            print(
                 f"Modelo YOLO no encontrado en: {MODEL_PATH}\n"
                 f"Por favor descarga el modelo o ajusta MODEL_PATH"
             )
