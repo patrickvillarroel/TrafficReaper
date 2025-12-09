@@ -1,4 +1,5 @@
 import json
+import logging.config
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
@@ -35,6 +36,28 @@ _COMPRESSED_DESCRIPTION = "Retornar imagen comprimida"
 
 # Mensajes de error
 _TASK_NO_ENCONTRADA = "Task no encontrada"
+_logger = logging.getLogger("API")
+_logger.setLevel(logging.INFO)
+logging.config.dictConfig({
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        },
+    },
+    "handlers": {
+        "default": {
+            "level": "INFO",
+            "formatter": "default",
+            "class": "logging.StreamHandler",
+        },
+    },
+    "root": {
+        "handlers": ["default"],
+        "level": "INFO",
+    },
+})
 
 # Cola de procesamiento (en producción usar Celery/Redis)
 task_results: dict[str, TaskResult] = {}  # {task_id: result_dict}
@@ -46,20 +69,26 @@ def process_image_task(task_id: str, image_bytes: bytes):
         from traffic_analyzer import analyze_image
 
         # Actualizar estado
+        _logger.info(f"Processing task {task_id}")
         task_results[task_id].status = TaskStatus.PROCESSING
 
         # Convertir bytes a numpy array (sin guardar en disco)
+        _logger.debug("Decoding image bytes")
         nparr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if frame is None:
+            _logger.error("Error decodificando imagen")
             raise ValueError("No se pudo decodificar la imagen")
 
         # Comprimir si es necesario
+        _logger.debug("Compressing image if needed")
         frame = compress_image_if_needed(frame)
 
         # Analizar
+        _logger.debug("Analyzing image with YOLO")
         result = analyze_image(frame, save_outputs=True, save_dir=_OUTPUTS_DIR)
+        _logger.info(f"Analysis completed for task {task_id}")
 
         # Guardar resultado con task_id y timestamps
         result["task_id"] = task_id
@@ -71,6 +100,7 @@ def process_image_task(task_id: str, image_bytes: bytes):
 
         # Guardar JSON del resultado
         result_path = _OUTPUTS_DIR / f"result_{task_id}_{timestamp}.json"
+        _logger.info(f"Saving result to {result_path}")
         with io.open(result_path, "w") as f:
             json.dump(result, f, indent=2)
 
@@ -80,9 +110,10 @@ def process_image_task(task_id: str, image_bytes: bytes):
         actual.completed_at = result["completed_at"]
         actual.result = DetectionResult(**result)
         task_results[task_id] = actual
+        _logger.info(f"Task {task_id} completed successfully")
 
     except Exception as e:
-        print(f"Error procesando task {task_id}: {e}")
+        _logger.error(f"Error procesando task {task_id}", exc_info=e)
         actual = task_results[task_id]
         actual.status = TaskStatus.FAILED
         actual.completed_at = datetime.now().isoformat()
@@ -126,12 +157,14 @@ def get_model_info():
         # Agregar el directorio raíz al path
         project_root = Path(__file__).parent.parent.resolve()
         if str(project_root) not in sys.path:
+            _logger.warning(f"Agregando {project_root} a sys.path para cargar el modelo")
             sys.path.insert(0, str(project_root))
 
         from traffic_analyzer import get_model_info
 
         return get_model_info()
     except Exception as e:
+        _logger.error("Error cargando modelo YOLO", exc_info=e)
         return {
             "error": str(e),
             "loaded": False
@@ -152,11 +185,13 @@ async def analyze_image_endpoint(
     # Validar archivo
     is_valid, message = validate_image_file(file)
     if not is_valid:
+        _logger.error(f"Invalid image file: {message}")
         raise HTTPException(status_code=400, detail=message)
 
     # Leer contenido en memoria
     contents = await file.read()
     if len(contents) > _MAX_IMAGE_SIZE:
+        _logger.error(f"Image size exceeds limit of {_MAX_IMAGE_SIZE} bytes")
         raise HTTPException(
             status_code=400,
             detail=f"Imagen muy grande. Máximo: {_MAX_IMAGE_SIZE / 1024 / 1024} MB"
@@ -173,6 +208,7 @@ async def analyze_image_endpoint(
         original_filename=file.filename
     )
 
+    _logger.info(f"Task {task_id} enqueue")
     # Agregar a background tasks (pasamos bytes directamente)
     background_tasks.add_task(process_image_task, task_id, contents)
 
@@ -192,7 +228,8 @@ def get_task_result(task_id: str, request: Request):
     """
     # Buscar en memoria
     if task_id in task_results:
-        task_data = task_results[task_id].model_copy()
+        task_data = task_results[task_id].model_copy(deep=True)
+        _logger.info(f"Task {task_id} found in memory with status {task_data.status}")
 
         # Convertir paths a URLs si la tarea está completada
         if task_data.status == TaskStatus.COMPLETED and task_data.result:
@@ -202,14 +239,18 @@ def get_task_result(task_id: str, request: Request):
         return task_data
 
     # Buscar en disco
+    _logger.info(f"Task {task_id} not found in memory, trying disk")
     task_data = load_task_from_json(task_id, _OUTPUTS_DIR)
     if task_data:
+        _logger.info(f"Task {task_id} FOUND in disk with status {task_data.status}, adding to memory for future requests")
+        task_results[task_id] = task_data.model_copy(deep=True)
         # Convertir paths a URLs
         base_url = str(request.base_url).rstrip("/")
         task_data.result = convert_paths_to_urls(task_id, task_data.result, base_url)
 
         return task_data
 
+    _logger.error(f"Task {task_id} not found in memory or disk")
     raise HTTPException(status_code=404, detail="Task no encontrada")
 
 
@@ -229,6 +270,7 @@ def list_tasks(
 
     # Cargar tareas desde disco si se solicita
     if include_disk:
+        _logger.info("Including disk tasks in list results")
         seen_task_ids = {t.task_id for t in tasks}
 
         # Buscar todos los JSON de resultados
@@ -244,6 +286,8 @@ def list_tasks(
                     if file_task_id not in seen_task_ids:
                         task_data = load_task_from_json(file_task_id, _OUTPUTS_DIR)
                         if task_data:
+                            _logger.debug(f"Adding task {file_task_id} from disk to memory for future requests")
+                            task_results[file_task_id] = task_data.model_copy(deep=True)
                             tasks.append(task_data)
                             seen_task_ids.add(file_task_id)
             except Exception as e:
@@ -265,16 +309,19 @@ def list_tasks(
 
     # Obtener tareas de la página actual
     page_tasks = tasks[start_idx:end_idx]
+    result_list = []
 
     # Convertir paths a URLs en los resultados
     if request:
         base_url = str(request.base_url).rstrip("/")
         for task in page_tasks:
-            if task.status == TaskStatus.COMPLETED and task.result:
-                task.result = convert_paths_to_urls(task.task_id, task.result, base_url)
+            task_copy = task.model_copy(deep=True)
+            if task_copy.status == TaskStatus.COMPLETED and task_copy.result:
+                task_copy.result = convert_paths_to_urls(task.task_id, task.result, base_url)
+            result_list.append(task_copy)
 
     return PaginatedResponse(
-        data=page_tasks,
+        data=result_list,
         total=total,
         page=page,
         page_size=page_size,
@@ -291,12 +338,18 @@ def _get_result(task_id: str):
 
     # Si no está en memoria, buscar en disco
     if not task_data:
+        _logger.info(f"Task {task_id} not found in memory for image, trying disk")
         task_data = load_task_from_json(task_id, _OUTPUTS_DIR)
+        if task_data:
+            _logger.info(f"Task {task_id} FOUND in disk with status {task_data.status} for image, adding to memory for future requests")
+            task_results[task_id] = task_data
 
     if not task_data:
+        _logger.warning(f"Task {task_id} not found in memory or disk to load images result")
         raise HTTPException(status_code=404, detail=_TASK_NO_ENCONTRADA)
 
     if task_data.status != TaskStatus.COMPLETED:
+        _logger.warning(f"Task {task_id} not completed yet and trying to access image results")
         raise HTTPException(status_code=400, detail="Task no completada aún")
 
     return task_data.result
@@ -326,6 +379,8 @@ def get_overlay_image(
     overlay_path = result.saved_overlay if result is not None else None
 
     if not overlay_path or not Path(overlay_path).exists():
+        if overlay_path:
+            _logger.error(f"Overlay image found: {overlay_path}, but is not a existing path in server")
         raise HTTPException(status_code=404, detail="Imagen overlay no encontrada")
 
     return _deliver_image(overlay_path, compressed)
@@ -341,6 +396,8 @@ def get_heatmap_image(
     heat_path = result.saved_heatmap if result is not None else None
 
     if not heat_path or not Path(heat_path).exists():
+        if heat_path:
+            _logger.error(f"Heatmap image found: {heat_path}, but is not a existing path in server")
         raise HTTPException(status_code=404, detail="Heatmap no encontrado")
 
     return _deliver_image(heat_path, compressed)
